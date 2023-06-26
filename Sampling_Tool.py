@@ -37,6 +37,8 @@ class window (tk.Tk):
         for i in range(rows):
             for j in range(cols):
                 # Create a button and associate it with array coordinates
+                if i == 0 and j == 0:
+                    continue
                 grid_pos = tk.Frame(grid_frame)
 
                 button1 = tk.Button(grid_pos, text="", command=lambda row=i, col=j, dir=0: self.button_set_field(row, col, dir))
@@ -61,9 +63,9 @@ class window (tk.Tk):
         global movingAverageRingBuffer
         direction = dir % 2
         if direction == 0:
-            xvalues[row][col] = (-1 if dir == 0 else 1)*np.average(movingAverageRingBuffer)
+            yvalues[row][col] = (-1 if dir == 0 else 1)*np.average(movingAverageRingBuffer)
         else:
-            yvalues[row][col] = (-1 if dir == 1 else 1)*np.average(movingAverageRingBuffer)
+            xvalues[row][col] = (-1 if dir == 1 else 1)*np.average(movingAverageRingBuffer)
         self.grid_buttons[row][col][direction].config(text="ok")
         self.grid_buttons[row][col][direction + 2].config(text="ok")
 
@@ -94,7 +96,7 @@ class window (tk.Tk):
     def update_value(self):
         global currentValue
         # Update the label text with the ADC value
-        Bfield = np.round(currentValue * 1000, 3)
+        Bfield = np.round(np.average(movingAverageRingBuffer) * 1000, 3)
         self.value.config(text=f"current magnetic field: {Bfield} mT")
 
         # Schedule the next update
@@ -116,7 +118,7 @@ currentValue = 0
 raw_data =  []
 data     =  []
 timepoint = []
-movingAverageRingBuffer = [0]*50
+movingAverageRingBuffer = [0]*500
 RunADC = True
 
 xvalues : list[list[float]] = [[]]
@@ -178,27 +180,42 @@ def sampleloop(mcp2221 : PyMCP2221A.PyMCP2221A):
     global timepoint
     global currentValue
     global movingAverageRingBuffer
+    #connect to serial port of the ESP32
     ser = serial.Serial('/dev/ttyUSB0', 250000)
+    #clear the serial pipe
     ser.flush()
     ser.readline().decode().strip()
     #mcp2221.ADC_DataRead()
     movingAverageIndex = 0
     while True:
         try:
-            #send samplecommand
-            currentValue = voltageToField(adcToVoltage(12, 2.5, int(ser.readline().decode().strip())))
+            #read serial terminal and convert to int
+            adcValue = int(ser.readline().decode().strip())
+            #value plausability check, skip if it is out of the expected range
+            if adcValue > 2**12 or adcValue < 0:
+                continue
+            #convert to magnetic field
+            currentValue = voltageToField(adcToVoltage(12, 2.635, adcValue))      #Vref parameter for conversion was fine-tuned to match at 0.6V (zero field voltage)
+            #append to plot and fft arrays
             timepoint.append( time.time() - starttime)
-            data.append(currentValue) # ADC Data (10-bit) values
+            data.append(currentValue)
+            #array for moving average for static readout
             movingAverageRingBuffer[movingAverageIndex] = currentValue
             movingAverageIndex +=1
             if movingAverageIndex >= len(movingAverageRingBuffer):
                 movingAverageIndex = 0
+            # set status message for GUI to know that the sensor is sampling
             if len(timepoint) % 100 == 0:
                 MCP2221status = f"sampled to value {len(timepoint)}"
             #mcp2221.ADC_DataRead()
         except OSError:
+            # deprecated. Used to automatically stop the sampling loop when the MCP2221 was suddenly disconnected or crashed
             MCP2221status = f"an error happened during reading\nrescuing data read by now\nsaved {len(timepoint)} data points"
             break
+        except ValueError:
+            #sometimes a lag spike during plotting causes a problem with the readout
+            continue
+        #check flag to exit loop. Flag needs to be set by another thread
         if not RunADC:
             MCP2221status = "halted sampling"
             break
@@ -208,11 +225,6 @@ def samplethread():
 #    initMCP2221A(mcp2221a)
     sampleloop(None)
 
-
-
-
-
-
 def plot():
     """
         function to plot data from global arrays data and timepoints
@@ -221,8 +233,6 @@ def plot():
     global timepoint
     L_data = data.copy()
     L_timepoint = timepoint.copy()
-
-
 
     # calculate the number of samples and the total time
     n = min(len(L_data), len(L_timepoint))
@@ -237,22 +247,27 @@ def plot():
     plt.ylabel('Magnetic Field (T)') # label the y-axis
 
     # apply fft to both channels and get the absolute values
+    L_data = np.multiply(L_data, 1/max(L_data))
     fft1 = np.abs(np.fft.fft(L_data)) / n
 
     fft1 = np.multiply(20, np.log10(fft1))
 
     # calculate the frequency array using fftfreq and deltat
     freq = np.fft.fftfreq(n, t/n)
+    halflen = int(len(freq)/2-1)
+    freq = freq[0:halflen]
+    fft1 = fft1[0:halflen]
 
     plt.subplot(1, 2, 2) # second row, second column
     plt.plot(freq, fft1, 'r-') # plot fft1 in red
     plt.xlabel('Frequency (Hz)') # label the x-axis
     plt.ylabel('DB') # label the y-axis
+    plt.xscale('log')
 
     # adjust the layout and show the plot
     plt.tight_layout()
     # Show the final plot
-    plt.show()
+    plt.show(block=False)
     
     # Create a meshgrid from the array shape
     X, Y = np.meshgrid(np.arange(len(xvalues[0])), np.arange(len(xvalues)))
@@ -261,25 +276,32 @@ def plot():
     U = np.array(xvalues)
     V = np.array(yvalues)
 
+    # Calculate vector magnitudes
+    magnitude = np.sqrt(U**2 + V**2)
+    
+    # Normalize vector lengths, handle zero vectors
+    mask = magnitude > 0
+    U_normalized = np.where(mask, U / magnitude, 0)
+    V_normalized = np.where(mask, V / magnitude, 0)
+
     # Create a new figure and axis
     fig, ax = plt.subplots()
-
-    # Plot the vectors using the quiver function
-    ax.quiver(X, Y, U, V)
+    
+    q = ax.quiver(X, Y, U_normalized, V_normalized, magnitude*1000, cmap='jet', scale=10)
 
     # Customize the plot as desired
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_title('Sensor Data Vector Plot')
+    ax.set_title('Magnetfeld')
 
+    # Add a colorbar to show the magnitude scale
+    cbar = plt.colorbar(q, label='Amplitude (mT)')
     # Show the plot
-    plt.show()
+    plt.show(block=False)
 
 if (__name__ == "__main__"):
     adc_thread = threading.Thread(target=samplethread)
     adc_thread.daemon = True  # Allow the thread to exit when the main program finishes
     adc_thread.start()        # start sampling thread
-    win = window()
+    win = window()            # set up the UI
     win.mainloop()            # run UI
     RunADC = False            # close sampling thread when UI is closed
-    adc_thread.join()
+    adc_thread.join()         # make sure the sampling thread gets closed correctly
